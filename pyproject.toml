@@ -1,6 +1,6 @@
 [project]
 name = "carla-ardy-backend"
-version = "0.0.0"
+version = "0.1.0"
 description = "ARDY human motion generation served over autoware_carla_scenario's pedestrian motion contract (gRPC)"
 readme = "README.md"
 license = "Apache-2.0"
