@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: lint and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # The server and its tests need no torch: the model is the image's.
+      - run: uv sync --frozen
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen mypy src tests
+      - run: uv run --frozen pytest -q
+      - name: The vendored contract is autoware_carla_scenario's
+        run: uv run --frozen python scripts/check_vendored.py --check
+
+  image:
+    name: build the image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # torch and its CUDA libraries take most of the runner's disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: carla_ardy_backend:ci
+      - name: The image's server imports
+        run: |
+          docker run --rm --entrypoint python carla_ardy_backend:ci -c \
+            "import torch, ardy, carla_ardy_backend.ardy_engine, carla_ardy_backend.server; print(torch.__version__)"

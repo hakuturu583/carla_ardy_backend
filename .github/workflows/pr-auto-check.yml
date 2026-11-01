@@ -1,0 +1,31 @@
+name: PR Auto Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    branches: [main]
+
+jobs:
+  check-version-bump-label:
+    name: Check Version Bump Label
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check for version bump label
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // As autoware_carla_scenario: every pull request says how it
+            // bumps the version, which the release workflow reads on merge.
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            const labels = pr.labels.map(label => label.name);
+            console.log(`PR Labels: ${labels.join(', ')}`);
+            if (['bump patch', 'bump minor', 'bump major'].some(l => labels.includes(l))) {
+              return;
+            }
+            core.setFailed('PR must have one of the following labels:\n' +
+              '  - bump patch\n  - bump minor\n  - bump major');
