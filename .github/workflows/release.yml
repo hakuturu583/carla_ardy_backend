@@ -1,0 +1,289 @@
+name: Release
+
+# As autoware_carla_scenario's release: a merged pull request's `bump major`,
+# `bump minor` or `bump patch` label bumps `version` in pyproject.toml, which
+# is committed ("chore: bump version to X.Y.Z"), tagged vX.Y.Z and released;
+# here the release is the image, pushed to
+# ghcr.io/hakuturu583/carla_ardy_backend as X.Y.Z and latest.
+
+on:
+  push:
+    branches:
+      - main
+  # Finishes the release of a version a labelled merge already bumped to, for
+  # when a later step failed (the tag, the Release, the image): it builds from
+  # that version's tag, or else from its "chore: bump version to X" commit,
+  # never from main's HEAD. Every step is safe to repeat.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to finish releasing, e.g. 0.2.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+      latest: ${{ steps.version.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # GH_PAT, when the repository has one, lets the bump commit and the
+          # tag through a branch ruleset whose bypass list does not include
+          # github-actions[bot].
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Get merged PR labels
+        if: github.event_name == 'push'
+        id: pr-labels
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha
+            });
+            const mergedPR = prs.find(pr => pr.merged_at !== null);
+            if (!mergedPR) {
+              console.log('No merged PR found for this commit');
+              core.setOutput('bump_type', 'none');
+              return;
+            }
+            const labels = mergedPR.labels.map(label => label.name);
+            console.log(`PR #${mergedPR.number} labels: ${labels.join(', ')}`);
+            core.setOutput('pr_number', mergedPR.number);
+            core.setOutput('pr_title', mergedPR.title);
+            core.setOutput('pr_url', mergedPR.html_url);
+            core.setOutput('pr_author', mergedPR.user.login);
+            let bumpType = 'none';
+            if (labels.includes('bump major')) {
+              bumpType = 'major';
+            } else if (labels.includes('bump minor')) {
+              bumpType = 'minor';
+            } else if (labels.includes('bump patch')) {
+              bumpType = 'patch';
+            }
+            core.setOutput('bump_type', bumpType);
+
+      - name: Bump version
+        if: github.event_name == 'push' && steps.pr-labels.outputs.bump_type != 'none'
+        id: bump-version
+        env:
+          BUMP_TYPE: ${{ steps.pr-labels.outputs.bump_type }}
+        run: |
+          current_version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          if [ -z "$current_version" ]; then
+            echo "ERROR: Could not extract version from pyproject.toml"
+            exit 1
+          fi
+          IFS='.' read -r major minor patch <<< "$current_version"
+          case "$BUMP_TYPE" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          new_version="${major}.${minor}.${patch}"
+          echo "Version: $current_version -> $new_version"
+          sed -i "s/^version = \".*\"/version = \"$new_version\"/" pyproject.toml
+          # The lock records the project's version: keep it in step.
+          uv lock
+          echo "new_version=${new_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit version bump
+        if: github.event_name == 'push' && steps.pr-labels.outputs.bump_type != 'none'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add pyproject.toml uv.lock
+          git commit -m "chore: bump version to ${{ steps.bump-version.outputs.new_version }}"
+          git push origin main
+
+      - name: Resolve the version to release
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          BUMP_TYPE: ${{ steps.pr-labels.outputs.bump_type }}
+          BUMPED: ${{ steps.bump-version.outputs.new_version }}
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          read_version() {
+            git show "$1:pyproject.toml" | sed -n 's/^version = "\(.*\)"/\1/p'
+          }
+          if [ "${EVENT}" = "workflow_dispatch" ]; then
+            version="${REQUESTED#v}"
+            if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "ERROR: '${REQUESTED}' is not a version like 0.2.0"
+              exit 1
+            fi
+            git fetch --tags --quiet origin
+            if git rev-parse --verify --quiet "refs/tags/v${version}" > /dev/null; then
+              sha=$(git rev-list -n 1 "v${version}")
+            else
+              sha=$(git log origin/main -1 --format=%H \
+                --grep="^chore: bump version to ${version//./\\.}\$")
+            fi
+            if [ -z "${sha}" ]; then
+              echo "ERROR: no v${version} tag and no 'chore: bump version to ${version}' commit on main"
+              exit 1
+            fi
+            if [ "$(read_version "${sha}")" != "${version}" ]; then
+              echo "ERROR: ${sha} does not carry version ${version}"
+              exit 1
+            fi
+          elif [ "${BUMP_TYPE}" != "none" ]; then
+            version="${BUMPED}"
+            sha=$(git rev-parse HEAD)
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Only the version main is at becomes "latest".
+          if [ "$(read_version origin/main)" = "${version}" ]; then
+            latest=true
+          else
+            latest=false
+          fi
+          echo "Releasing v${version} from ${sha} (latest: ${latest})"
+          {
+            echo "version=${version}"
+            echo "sha=${sha}"
+            echo "latest=${latest}"
+            echo "release=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Git tag
+        if: steps.version.outputs.release == 'true'
+        env:
+          TAG: v${{ steps.version.outputs.version }}
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" > /dev/null; then
+            echo "${TAG} already exists; not moving it."
+            exit 0
+          fi
+          git tag "${TAG}" "${SHA}"
+          git push origin "${TAG}"
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.release == 'true'
+        uses: actions/github-script@v7
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.version }}
+          LATEST: ${{ steps.version.outputs.latest }}
+          BUMP_TYPE: ${{ steps.pr-labels.outputs.bump_type }}
+          PR_NUMBER: ${{ steps.pr-labels.outputs.pr_number }}
+          PR_TITLE: ${{ steps.pr-labels.outputs.pr_title }}
+          PR_URL: ${{ steps.pr-labels.outputs.pr_url }}
+          PR_AUTHOR: ${{ steps.pr-labels.outputs.pr_author }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = `v${process.env.NEW_VERSION}`;
+            try {
+              const { data: existing } = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner, repo: context.repo.repo, tag,
+              });
+              console.log(`Release already exists: ${existing.html_url}`);
+              return;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            const image = `ghcr.io/${context.repo.owner.toLowerCase()}/${context.repo.repo.toLowerCase()}:${process.env.NEW_VERSION}`;
+            const fromPR = Boolean(process.env.PR_NUMBER);
+            const body = [
+              ...(fromPR
+                ? [
+                    `## What's Changed`,
+                    ``,
+                    `- ${process.env.PR_TITLE} (#${process.env.PR_NUMBER}) by @${process.env.PR_AUTHOR}`,
+                    ``,
+                    `**Full Changelog**: ${process.env.PR_URL}`,
+                    ``,
+                  ]
+                : []),
+              `Image: \`${image}\``,
+              ``,
+              `---`,
+              ``,
+              fromPR
+                ? `This release was created by automated workflow (bump ${process.env.BUMP_TYPE}).`
+                : 'This release was created by a manual run of the release workflow.',
+            ].join('\n');
+            const { data: release } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `Release ${tag}`,
+              body,
+              generate_release_notes: !fromPR,
+              make_latest: process.env.LATEST === 'true' ? 'true' : 'false',
+            });
+            console.log(`Created release: ${release.html_url}`);
+
+  # The release is the image: built from the release commit and pushed to
+  # ghcr.io as the version, and as latest when main is at it.
+  image:
+    name: push the image
+    needs: release
+    if: needs.release.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.sha }}
+
+      - name: Check the package version matches the release
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          pkg=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          echo "release=${VERSION} pyproject=${pkg}"
+          test "${pkg}" = "${VERSION}"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+
+      - name: Image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ needs.release.outputs.version }}
+            ${{ needs.release.outputs.latest == 'true' && format('{0}:latest', steps.image.outputs.name) || '' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.release.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.release.outputs.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
